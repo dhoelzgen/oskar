@@ -20,8 +20,7 @@ use embassy_rp::spi::{Config as SpiConfig, Spi};
 use embassy_rp::usb::{Driver, InterruptHandler as USBInterruptHandler};
 use embassy_rp::watchdog::Watchdog;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcAcmState};
-use embassy_usb::class::hid::{HidReaderWriter, State as Hid_State};
-use usbd_hid::descriptor::{KeyboardReport, MediaKeyboardReport, SerializedDescriptor};
+use embassy_usb::class::midi::MidiClass;
 
 use embassy_usb::{Config as UsbConfig, UsbDevice};
 use heapless::String;
@@ -175,35 +174,9 @@ async fn main(spawner: Spawner) {
     }
 
     if !(matches!(mode, DeviceMode::Picoprog)) {
-        let keyboard_class: HidReaderWriter<'_, Driver<'_, USB>, 1, 8> = {
-            static STATE: StaticCell<Hid_State> = StaticCell::new();
-            let state = STATE.init(Hid_State::new());
+        let midi_class = MidiClass::new(&mut builder, 1, 1, 64);
 
-            let config = embassy_usb::class::hid::Config {
-                report_descriptor: KeyboardReport::desc(),
-                request_handler: None,
-                poll_ms: 60,
-                max_packet_size: 64,
-            };
-
-            HidReaderWriter::new(&mut builder, state, config)
-        };
-
-        let multimedia_class: HidReaderWriter<'_, Driver<'_, USB>, 1, 8> = {
-            static STATE: StaticCell<Hid_State> = StaticCell::new();
-            let state = STATE.init(Hid_State::new());
-
-            let config = embassy_usb::class::hid::Config {
-                report_descriptor: MediaKeyboardReport::desc(),
-                request_handler: None,
-                poll_ms: 60,
-                max_packet_size: 64,
-            };
-
-            HidReaderWriter::new(&mut builder, state, config)
-        };
-
-        spawner.spawn(hid::hid_task(spawner, keyboard_class, multimedia_class, r.hid, r.encoder)).unwrap();
+        spawner.spawn(hid::hid_task(spawner, midi_class, r.hid, r.encoder)).unwrap();
     }
 
     let usb = builder.build();

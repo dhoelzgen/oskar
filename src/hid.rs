@@ -1,5 +1,5 @@
 use crate::{EncoderResources, ButtonResources};
-use crate::layouts::{KeyLayout};
+use crate::layouts::{KeyLayout, MidiConfig};
 use defmt::unreachable;
 use defmt_rtt as _;
 use embassy_executor::{InterruptExecutor, Spawner};
@@ -9,11 +9,11 @@ use embassy_rp::interrupt;
 use embassy_rp::interrupt::{InterruptExt, Priority};
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
-use embassy_usb::class::hid::HidReaderWriter;
-use usbd_hid::descriptor::*;
+use embassy_usb::class::midi::MidiClass;
 use embassy_sync::pubsub::PubSubChannel;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-type CustomHid = HidReaderWriter<'static, Driver<'static, USB>, 1, 8>;
+
+type CustomMidi = MidiClass<'static, Driver<'static, USB>>;
 static KEY_EVENT_QUEUE: PubSubChannel::<CriticalSectionRawMutex, KeyEvent, 2, 2, 2> = PubSubChannel::new();
 
 #[derive(Clone)]
@@ -33,28 +33,35 @@ enum Event {
     Pressed,
     Released,
 }
+
 #[derive(Clone)]
 struct KeyEvent {
     key: Key,
     event: Event,
 }
 
-pub enum KeyType {
-    Media(MediaKey),
-    Keycode(KeyboardUsage),
+pub struct MidiCC {
+    pub controller: u8,
+    pub value_on: u8,
+    pub value_off: u8,
 }
 
-const KEYLAYOUT:KeyLayout = KeyLayout {
-    encoder_left: KeyType::Media(MediaKey::VolumeDecrement),
-    encoder_right: KeyType::Media(MediaKey::VolumeIncrement),
-    encoder_button: KeyType::Media(MediaKey::Mute),
-    key1: KeyType::Keycode(KeyboardUsage::KeyboardOo),
-    key2: KeyType::Keycode(KeyboardUsage::KeyboardSs),
-    key3: KeyType::Keycode(KeyboardUsage::KeyboardFf),
+// MIDI Configuration: Channel 15 (0-indexed as 14), configurable CC numbers
+const MIDI_CONFIG: MidiConfig = MidiConfig {
+    channel: 14, // MIDI channel 15 (0-indexed)
+};
+
+const KEYLAYOUT: KeyLayout = KeyLayout {
+    encoder_left: MidiCC { controller: 1, value_on: 127, value_off: 0 },    // CC 1 (Modulation)
+    encoder_right: MidiCC { controller: 2, value_on: 127, value_off: 0 },   // CC 2 (Breath Controller)
+    encoder_button: MidiCC { controller: 3, value_on: 127, value_off: 0 },  // CC 3
+    key1: MidiCC { controller: 20, value_on: 127, value_off: 0 },           // CC 20
+    key2: MidiCC { controller: 21, value_on: 127, value_off: 0 },           // CC 21
+    key3: MidiCC { controller: 22, value_on: 127, value_off: 0 },           // CC 22
 };
 
 #[embassy_executor::task]
-pub async fn hid_task(spawner: Spawner, mut keyboard_class: CustomHid, mut multimedia_class: CustomHid, button_resources: ButtonResources, encoder_resources: EncoderResources) -> ! {
+pub async fn hid_task(spawner: Spawner, mut midi_class: CustomMidi, button_resources: ButtonResources, encoder_resources: EncoderResources) -> ! {
 
     interrupt::SWI_IRQ_0.set_priority(Priority::P2);
     let spawner_encoder: embassy_executor::SendSpawner = EXECUTOR_ENCODER.start(interrupt::SWI_IRQ_0);
@@ -69,22 +76,22 @@ pub async fn hid_task(spawner: Spawner, mut keyboard_class: CustomHid, mut multi
 
         match key_event.key {
             Key::EncoderLeft => {
-                (keyboard_class, multimedia_class) = handle_encoder_interaction(keyboard_class, multimedia_class, KEYLAYOUT.encoder_left).await;
+                midi_class = handle_encoder_interaction(midi_class, KEYLAYOUT.encoder_left).await;
             },
             Key::EncoderRight => {
-                (keyboard_class, multimedia_class) = handle_encoder_interaction(keyboard_class, multimedia_class, KEYLAYOUT.encoder_right).await;
+                midi_class = handle_encoder_interaction(midi_class, KEYLAYOUT.encoder_right).await;
             },
             Key::EncoderButton => {
-                (keyboard_class, multimedia_class) = send_code(keyboard_class, multimedia_class, KEYLAYOUT.encoder_button, key_event.event).await;
+                midi_class = send_midi_cc(midi_class, KEYLAYOUT.encoder_button, key_event.event).await;
             },
             Key::Key1 => {
-                (keyboard_class, multimedia_class) = send_code(keyboard_class, multimedia_class, KEYLAYOUT.key1, key_event.event).await;
+                midi_class = send_midi_cc(midi_class, KEYLAYOUT.key1, key_event.event).await;
             },
             Key::Key2 => {
-                (keyboard_class, multimedia_class) = send_code(keyboard_class, multimedia_class, KEYLAYOUT.key2, key_event.event).await;
+                midi_class = send_midi_cc(midi_class, KEYLAYOUT.key2, key_event.event).await;
             },
             Key::Key3 => {
-                (keyboard_class, multimedia_class) = send_code(keyboard_class, multimedia_class, KEYLAYOUT.key3,key_event.event).await;
+                midi_class = send_midi_cc(midi_class, KEYLAYOUT.key3, key_event.event).await;
             }
         }
     }
@@ -178,93 +185,63 @@ pub async fn button_task(r: ButtonResources) -> ! {
 }
 
 
-async fn handle_encoder_interaction(mut keyboard_class: CustomHid, mut media_class: CustomHid, code: KeyType) -> (CustomHid, CustomHid) {
-
-    match code {
-        KeyType::Media(media_key) =>    {
-
-            let mut report = MediaKeyboardReport {
-                usage_id: media_key as u16,
-            };
-
-            if let Err(e) = media_class.write_serialize(&report).await {
-                log::error!("Failed to send HID key press: {:?}", e);
-            }
-
-            report = MediaKeyboardReport {
-                usage_id: 0x00 as u16,
-            };
-
-            if let Err(e) = media_class.write_serialize(&report).await {
-                log::error!("Failed to send HID key press: {:?}", e);
-            }
-        },
-
-        KeyType::Keycode(keyboard_usage) => {
-            let keycodes: [u8; 6] = [keyboard_usage as u8, 0, 0, 0, 0, 0];
-
-            let mut report: KeyboardReport = KeyboardReport {
-                keycodes: keycodes,
-                leds: 0,
-                modifier: 0,
-                reserved: 0,
-            };
-
-            if let Err(e) = keyboard_class.write_serialize(&report).await {
-                log::error!("Failed to send HID key press: {:?}", e);
-            }
-
-            report.keycodes = [0,0,0,0,0,0];
-
-            if let Err(e) = keyboard_class.write_serialize(&report).await {
-                log::error!("Failed to send HID key press: {:?}", e);
-            }
-        },
-    };
-
-
-
-    return (keyboard_class, media_class)
+async fn handle_encoder_interaction(mut midi_class: CustomMidi, cc: MidiCC) -> CustomMidi {
+    // For encoder, send value_on, then immediately send value_off to create a momentary trigger
+    // MIDI CC packet format: [CIN+Cable, Status, Controller, Value]
+    // CIN for Control Change is 0xB, Cable is 0, so first byte is 0x0B
+    // Status byte is 0xB0 + channel (0xBE for channel 15)
+    
+    let status_byte = 0xB0 | MIDI_CONFIG.channel;
+    
+    // Send CC with value_on
+    let packet_on = [
+        0x0B,           // CIN: Control Change (0xB) + Cable 0 (0x0)
+        status_byte,    // Status: Control Change on configured channel
+        cc.controller,  // Controller number
+        cc.value_on,    // Value
+    ];
+    
+    if let Err(e) = midi_class.write_packet(&packet_on).await {
+        log::error!("Failed to send MIDI CC on: {:?}", e);
+    }
+    
+    // Small delay to ensure the message is recognized
+    embassy_time::Timer::after(embassy_time::Duration::from_millis(10)).await;
+    
+    // Send CC with value_off
+    let packet_off = [
+        0x0B,
+        status_byte,
+        cc.controller,
+        cc.value_off,
+    ];
+    
+    if let Err(e) = midi_class.write_packet(&packet_off).await {
+        log::error!("Failed to send MIDI CC off: {:?}", e);
+    }
+    
+    return midi_class;
 }
 
-async fn send_code(mut keyboard_class: CustomHid, mut media_class: CustomHid , code: KeyType, event: Event) -> (CustomHid, CustomHid) {
-
-    match code {
-        KeyType::Media(media_key) =>    {
-
-            let code = match event {
-                Event::Pressed => media_key as u16,
-                Event::Released => 0x00 as u16,
-            };
-
-            let report = MediaKeyboardReport {
-                usage_id: code,
-            };
-
-            if let Err(e) = media_class.write_serialize(&report).await {
-                log::error!("Failed to send HID key press: {:?}", e);
-            }
-        },
-
-        KeyType::Keycode(keyboard_usage) => {
-            let keycodes: [u8; 6] = if event == Event::Pressed {
-                [keyboard_usage as u8, 0, 0, 0, 0, 0]
-            } else {
-                [0, 0, 0, 0, 0, 0]
-            };
-
-            let report: KeyboardReport = KeyboardReport {
-                keycodes: keycodes,
-                leds: 0,
-                modifier: 0,
-                reserved: 0,
-            };
-
-            if let Err(e) = keyboard_class.write_serialize(&report).await {
-                log::error!("Failed to send HID key press: {:?}", e);
-            }
-        },
+async fn send_midi_cc(mut midi_class: CustomMidi, cc: MidiCC, event: Event) -> CustomMidi {
+    // MIDI CC packet format: [CIN+Cable, Status, Controller, Value]
+    let status_byte = 0xB0 | MIDI_CONFIG.channel;
+    
+    let value = match event {
+        Event::Pressed => cc.value_on,
+        Event::Released => cc.value_off,
     };
+    
+    let packet = [
+        0x0B,           // CIN: Control Change (0xB) + Cable 0 (0x0)
+        status_byte,    // Status: Control Change on configured channel
+        cc.controller,  // Controller number
+        value,          // Value
+    ];
+    
+    if let Err(e) = midi_class.write_packet(&packet).await {
+        log::error!("Failed to send MIDI CC: {:?}", e);
+    }
 
-    return (keyboard_class, media_class);
+    return midi_class;
 }
