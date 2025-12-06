@@ -57,41 +57,64 @@ cp target/thumbv6m-none-eabi/release/oskar.uf2 /Volumes/RPI-RP2/
 
 ### Modes
 
-The Device features a 3-position selection switch on its left side. When the switch is moved all the way to the back it simply acts as the picoprog featuring SPI and UART capabilities (Green LED). Moved all the way to the front it acts as a Macro Keyboard (Red LED). With the switch in the middle position the device combines both features at once (purple LED).
+The Device features a 3-position selection switch on its left side. When the switch is moved all the way to the back it simply acts as the picoprog featuring SPI and UART capabilities (Green LED). Moved all the way to the front it acts as a MIDI Controller (Red LED). With the switch in the middle position the device combines both features at once (purple LED).
 
-### Macro Keyboard
+### MIDI Controller
 
-The standard firmware of the Keyboard has the encoder configured as volume knob with mute on press.
-The keys 1-3 (from left to right) are configured as o s and f (for open source firmware).
+The firmware configures the device as a USB MIDI controller that sends MIDI Control Change (CC) messages. The default configuration uses MIDI channel 15 to avoid conflicts with other MIDI devices.
 
-At the top of the file `src/hid.rs` there is a constant struct called ```KEYLAYOUT```.
+#### Default Configuration
 
+At the top of the file `src/hid.rs` there are two constant structs:
+
+**MIDI Channel Configuration:**
 ```rust
-const KEYLAYOUT:KeyLayout = KeyLayout {
-    encoder_left: KeyType::Media(MediaKey::VolumeDecrement),
-    encoder_right: KeyType::Media(MediaKey::VolumeIncrement),
-    encoder_button: KeyType::Media(MediaKey::Mute),
-    key1: KeyType::Keycode(KeyboardUsage::KeyboardOo),
-    key2: KeyType::Keycode(KeyboardUsage::KeyboardSs),
-    key3: KeyType::Keycode(KeyboardUsage::KeyboardFf),
+const MIDI_CONFIG: MidiConfig = MidiConfig {
+    channel: 14, // MIDI channel 15 (0-indexed)
 };
 ```
 
-The struct holds the current configuration of the Keyboard, each key can be configured to any keycode of the enum ```KeyType``` located in `src/hid_codes.rs`
-for example:
-
+**Key Layout Configuration:**
 ```rust
-const KEYLAYOUT:KeyLayout = KeyLayout {
-    encoder_left: KeyType::Media(MediaKey::VolumeDecrement),
-    encoder_right: KeyType::Media(MediaKey::VolumeIncrement),
-    encoder_button: KeyType::Media(MediaKey::Mute),
-    key1: KeyType::Keycode(KeyboardUsage::KeyboardF10),
-    key2: KeyType::Keycode(KeyboardUsage::KeyboardF11),
-    key3: KeyType::Keycode(KeyboardUsage::KeyboardF12),
+const KEYLAYOUT: KeyLayout = KeyLayout {
+    encoder_left: MidiCC { controller: 1, value_on: 127, value_off: 0 },    // CC 1 (Modulation)
+    encoder_right: MidiCC { controller: 2, value_on: 127, value_off: 0 },   // CC 2 (Breath Controller)
+    encoder_button: MidiCC { controller: 3, value_on: 127, value_off: 0 },  // CC 3
+    key1: MidiCC { controller: 20, value_on: 127, value_off: 0 },           // CC 20
+    key2: MidiCC { controller: 21, value_on: 127, value_off: 0 },           // CC 21
+    key3: MidiCC { controller: 22, value_on: 127, value_off: 0 },           // CC 22
 };
 ```
 
-Which could then be used to be configured as hotkeys in your operating system.
+#### Customization
+
+You can customize the MIDI configuration by editing these constants in `src/hid.rs`:
+
+1. **Change MIDI Channel**: Modify the `channel` value in `MIDI_CONFIG`. Note that channels are 0-indexed, so channel 15 is represented as 14.
+
+2. **Change CC Numbers**: Modify the `controller` value for each key. Valid values are 0-127.
+
+3. **Change CC Values**: Modify `value_on` (sent when button is pressed or encoder rotated) and `value_off` (sent when button is released or after encoder rotation).
+
+Example - Using different CC numbers:
+```rust
+const KEYLAYOUT: KeyLayout = KeyLayout {
+    encoder_left: MidiCC { controller: 10, value_on: 127, value_off: 0 },
+    encoder_right: MidiCC { controller: 11, value_on: 127, value_off: 0 },
+    encoder_button: MidiCC { controller: 12, value_on: 127, value_off: 0 },
+    key1: MidiCC { controller: 70, value_on: 127, value_off: 0 },
+    key2: MidiCC { controller: 71, value_on: 127, value_off: 0 },
+    key3: MidiCC { controller: 72, value_on: 127, value_off: 0 },
+};
+```
+
+#### Behavior
+
+- **Encoder rotation**: Sends a CC message with `value_on` followed immediately by a CC message with `value_off`, creating a momentary trigger effect.
+- **Button press**: Sends a CC message with `value_on`.
+- **Button release**: Sends a CC message with `value_off`.
+
+This allows the device to work with most MIDI software and DAWs that support MIDI CC learn or mapping.
 
 ### Serial (picocom or combined mode)
 
