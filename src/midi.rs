@@ -13,13 +13,14 @@ use embassy_sync::pubsub::PubSubChannel;
 use embassy_time::{Duration, Timer};
 use embassy_usb::class::midi::{MidiClass, Sender};
 
-static KEY_EVENT_QUEUE: PubSubChannel<CriticalSectionRawMutex, KeyEvent, 2, 2, 2> =
+static KEY_EVENT_QUEUE: PubSubChannel<CriticalSectionRawMutex, KeyEvent, 8, 2, 2> =
     PubSubChannel::new();
 
-// Encoder value counter (0-127) for absolute mode
-static ENCODER_VALUE: Mutex<CriticalSectionRawMutex, u8> = Mutex::new(64); // Start at middle (64)
+// Encoder value counters (0-127) for absolute mode - one per mode
+// [Mode1/Keyboard, Mode2/Picoprog, Mode3/Universal]
+static ENCODER_VALUES: Mutex<CriticalSectionRawMutex, [u8; 3]> = Mutex::new([64, 64, 64]); // Start at middle (64)
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum Key {
     EncoderLeft,
     EncoderRight,
@@ -29,7 +30,7 @@ enum Key {
     Key3,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum Event {
     Pressed,
     Released,
@@ -185,6 +186,10 @@ pub async fn midi_task(
 
     let mut sub = KEY_EVENT_QUEUE.subscriber().unwrap();
 
+    // Track which layout each key was pressed with to ensure matching release
+    let mut pressed_configs: heapless::FnvIndexMap<Key, MidiInputConfig, 4> =
+        heapless::FnvIndexMap::new();
+
     loop {
         let key_event: KeyEvent = sub.next_message_pure().await;
 
@@ -202,22 +207,73 @@ pub async fn midi_task(
 
         match key_event.key {
             Key::EncoderLeft => {
-                sender = handle_encoder_interaction(sender, &layout.encoder_left, false).await;
+                sender =
+                    handle_encoder_interaction(sender, &layout.encoder_left, false, current_mode)
+                        .await;
             }
             Key::EncoderRight => {
-                sender = handle_encoder_interaction(sender, &layout.encoder_right, true).await;
+                sender =
+                    handle_encoder_interaction(sender, &layout.encoder_right, true, current_mode)
+                        .await;
             }
             Key::EncoderButton => {
-                sender = send_midi_message(sender, &layout.encoder_button, key_event.event).await;
+                let config = match key_event.event {
+                    Event::Pressed => {
+                        // Store the config for this press
+                        let _ =
+                            pressed_configs.insert(key_event.key.clone(), layout.encoder_button);
+                        &layout.encoder_button
+                    }
+                    Event::Released => {
+                        // Use the stored config from when it was pressed
+                        pressed_configs
+                            .get(&key_event.key)
+                            .unwrap_or(&layout.encoder_button)
+                    }
+                };
+                sender = send_midi_message(sender, config, key_event.event).await;
+                if key_event.event == Event::Released {
+                    pressed_configs.remove(&key_event.key);
+                }
             }
             Key::Key1 => {
-                sender = send_midi_message(sender, &layout.key1, key_event.event).await;
+                let config = match key_event.event {
+                    Event::Pressed => {
+                        let _ = pressed_configs.insert(key_event.key.clone(), layout.key1);
+                        &layout.key1
+                    }
+                    Event::Released => pressed_configs.get(&key_event.key).unwrap_or(&layout.key1),
+                };
+                sender = send_midi_message(sender, config, key_event.event).await;
+                if key_event.event == Event::Released {
+                    pressed_configs.remove(&key_event.key);
+                }
             }
             Key::Key2 => {
-                sender = send_midi_message(sender, &layout.key2, key_event.event).await;
+                let config = match key_event.event {
+                    Event::Pressed => {
+                        let _ = pressed_configs.insert(key_event.key.clone(), layout.key2);
+                        &layout.key2
+                    }
+                    Event::Released => pressed_configs.get(&key_event.key).unwrap_or(&layout.key2),
+                };
+                sender = send_midi_message(sender, config, key_event.event).await;
+                if key_event.event == Event::Released {
+                    pressed_configs.remove(&key_event.key);
+                }
             }
             Key::Key3 => {
-                sender = send_midi_message(sender, &layout.key3, key_event.event).await;
+                let config = match key_event.event {
+                    Event::Pressed => {
+                        let _ = pressed_configs.insert(key_event.key.clone(), layout.key3);
+                        &layout.key3
+                    }
+                    Event::Released => pressed_configs.get(&key_event.key).unwrap_or(&layout.key3),
+                };
+                sender = send_midi_message(sender, config, key_event.event).await;
+                if key_event.event == Event::Released {
+                    pressed_configs.remove(&key_event.key);
+                }
             }
         }
     }
@@ -281,6 +337,9 @@ pub async fn button_task(r: ButtonResources) -> ! {
         ])
         .await;
 
+        // Small debounce delay to avoid reading bounce
+        Timer::after(Duration::from_millis(5)).await;
+
         match index {
             0 => match key1.get_level() {
                 Level::Low => publisher.publish_immediate(KeyEvent {
@@ -332,19 +391,27 @@ async fn handle_encoder_interaction(
     mut sender: Sender<'static, embassy_rp::usb::Driver<'static, embassy_rp::peripherals::USB>>,
     config: &MidiInputConfig,
     increment: bool,
+    mode: crate::DeviceMode,
 ) -> Sender<'static, embassy_rp::usb::Driver<'static, embassy_rp::peripherals::USB>> {
     // Step size for encoder (higher = faster, adjust to taste: 2, 4, 8, etc.)
     const ENCODER_STEP: u8 = 4;
 
-    // Update the internal counter (0-127) with saturation at boundaries
+    // Get mode index for the encoder value array
+    let mode_index = match mode {
+        crate::DeviceMode::Keyboard => 0,
+        crate::DeviceMode::Picoprog => 1,
+        crate::DeviceMode::Universal => 2,
+    };
+
+    // Update the internal counter (0-127) for this mode with saturation at boundaries
     let value = {
-        let mut counter = ENCODER_VALUE.lock().await;
+        let mut counters = ENCODER_VALUES.lock().await;
         if increment {
-            *counter = counter.saturating_add(ENCODER_STEP).min(127);
+            counters[mode_index] = counters[mode_index].saturating_add(ENCODER_STEP).min(127);
         } else {
-            *counter = counter.saturating_sub(ENCODER_STEP);
+            counters[mode_index] = counters[mode_index].saturating_sub(ENCODER_STEP);
         }
-        *counter
+        counters[mode_index]
     };
 
     let packet = encode_midi_packet(config, value);
